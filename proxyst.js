@@ -3,99 +3,10 @@ const https = require('https');
 const fs = require('fs');
 const { URL } = require('url');
 
-const PROXY_NAME = "La Puerta";
+const PROXY_NAME = "El Rio";
 // Load config with reloading capability
 let config = loadConfig();
 let PORT = config['service-port'] || 3000;
-
-// ========== RATE LIMITING ==========
-const rateLimit = new Map(); // Store request counts per IP
-
-// Clean up old entries every 5 minutes
-setInterval(() => {
-    const now = Date.now();
-    for (const [ip, data] of rateLimit.entries()) {
-        if (now - data.resetTime > 0) {
-            rateLimit.delete(ip);
-        }
-    }
-}, 300000); // 5 minutes
-
-function checkRateLimit(req) {
-    const ip = req.socket.remoteAddress;
-    const now = Date.now();
-    const windowMs = 60000; // 1 minute window
-    const maxRequests = 100; // SAME LIMIT FOR EVERYONE
-    
-    if (!rateLimit.has(ip)) {
-        rateLimit.set(ip, {
-            count: 1,
-            resetTime: now + windowMs
-        });
-        return { 
-            allowed: true, 
-            remaining: maxRequests - 1,
-            resetIn: 60
-        };
-    }
-    
-    const record = rateLimit.get(ip);
-    
-    // Reset if window expired
-    if (now > record.resetTime) {
-        record.count = 1;
-        record.resetTime = now + windowMs;
-        return { 
-            allowed: true, 
-            remaining: maxRequests - 1,
-            resetIn: 60
-        };
-    }
-    
-    // Check if over limit
-    if (record.count >= maxRequests) {
-        return { 
-            allowed: false, 
-            remaining: 0,
-            resetIn: Math.ceil((record.resetTime - now) / 1000)
-        };
-    }
-    
-    record.count++;
-    return { 
-        allowed: true, 
-        remaining: maxRequests - record.count,
-        resetIn: Math.ceil((record.resetTime - now) / 1000)
-    };
-}
-// ========== END RATE LIMITING ==========
-
-// ========== LOGGING FUNCTION ==========
-const logStream = fs.createWriteStream('proxy-access.log', { flags: 'a' });
-
-function logRequest(req, additionalInfo = {}) {
-    const logEntry = {
-        timestamp: new Date().toISOString(),
-        localTime: new Date().toLocaleTimeString(),
-        remoteAddress: req.socket.remoteAddress,
-        remotePort: req.socket.remotePort,
-        method: req.method,
-        url: req.url,
-        headers: req.headers,
-        httpVersion: req.httpVersion,
-        additionalInfo: additionalInfo
-    };
-    
-    // Write to file (pretty printed for readability, but you can remove the spaces for smaller files)
-  logStream.write(JSON.stringify(logEntry, null, 2) + '\n');
-    
-    // Also keep your console log for real-time viewing
-    console.log(`[${logEntry.localTime}] ${logEntry.method} ${logEntry.url} from ${logEntry.remoteAddress}`);
-    
-    return logEntry;
-}
-// ========== END LOGGING FUNCTION ==========
-
 
 // Watch config for changes
 fs.watchFile('config.json', (curr, prev) => {
@@ -126,17 +37,15 @@ function getHttpModule(url) {
     return url.protocol === 'https:' ? https : http;
 }
 
-// Helper: Forward request
-async function forwardRequest(req, targetUrl) {
+async function forwardRequest(req, res, targetUrl) {  // ← CHANGED: Added res parameter
     return new Promise((resolve, reject) => {
         const url = new URL(targetUrl);
         const httpModule = getHttpModule(url);
         
         // Prepare headers (remove host, add x-forwarded headers)
         const headers = { ...req.headers };
-        delete headers.host; // Target server will set its own host
+        delete headers.host;
         
-        // Add forwarding headers
         headers['x-forwarded-for'] = req.socket.remoteAddress;
         headers['x-forwarded-proto'] = req.socket.encrypted ? 'https' : 'http';
         headers['x-forwarded-host'] = req.headers.host;
@@ -147,37 +56,51 @@ async function forwardRequest(req, targetUrl) {
             path: url.pathname + url.search,
             method: req.method,
             headers: headers,
-            timeout: 10000 // 10 second timeout
+            timeout: 300000  // ← CHANGED: 5 minutes for large files
         };
         
         const proxyReq = httpModule.request(options, (proxyRes) => {
-            let body = [];
-            proxyRes.on('data', (chunk) => body.push(chunk));
+            // ✅ LINE 1: Send headers to browser immediately
+            res.writeHead(proxyRes.statusCode, proxyRes.headers);
+            
+            // ✅ LINE 2: STREAM directly to browser - THIS IS THE MAGIC!
+            proxyRes.pipe(res);  // ← Each chunk goes to browser as it arrives
+            
+            // ✅ LINE 3: When done, resolve
             proxyRes.on('end', () => {
-                const response = {
-                    statusCode: proxyRes.statusCode,
-                    headers: proxyRes.headers,
-                    body: Buffer.concat(body)
-                };
-                resolve(response);
+                resolve();  // No data needed, already streamed
             });
         });
         
-        proxyReq.on('error', reject);
+        proxyReq.on('error', (err) => {
+            // If error, make sure to end the response
+            if (!res.headersSent) {
+                res.writeHead(502);
+                res.end('Bad Gateway');
+            }
+            reject(err);
+        });
+        
         proxyReq.on('timeout', () => {
             proxyReq.destroy();
+            if (!res.headersSent) {
+                res.writeHead(504);
+                res.end('Gateway Timeout');
+            }
             reject(new Error('Request timeout'));
         });
         
-        // Forward request body if present
+        // ✅ THIS PART STAYS THE SAME - IT'S ALREADY GOOD!
         if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
-            req.pipe(proxyReq);
+            req.pipe(proxyReq);  // ← Already streams request body
         } else {
             proxyReq.end();
         }
     });
 }
 
+
+// Helper: Forward request
 // Find matching route
 function findMatchingRoute(requestPath) {
     // Sort by path length (longest first) to ensure most specific match first
@@ -211,36 +134,8 @@ function buildTargetUrl(route, requestUrl) {
 // Create server
 const server = http.createServer(async (req, res) => {
     const timestamp = new Date().toLocaleTimeString();
-    logRequest(req);    
-    
     console.log(`[${timestamp}] ${req.method} ${req.url} from ${req.socket.remoteAddress}`);
-    // ===== RATE LIMITING CHECK =====
-const rateCheck = checkRateLimit(req);
-
-// Add rate limit headers
-// res.setHeader('X-RateLimit-Limit', 100);
-// res.setHeader('X-RateLimit-Remaining', rateCheck.remaining);
-
-if (!rateCheck.allowed) {
-   // res.setHeader('X-RateLimit-Reset', rateCheck.resetIn);
     
-    logRequest(req, { 
-        blocked: 'rate_limit_exceeded',
-        resetIn: rateCheck.resetIn
-    });
-    
-    res.writeHead(429, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-        error: 'Too Many Requests',
-        proxy: PROXY_NAME
-    }));
-    console.log(`🚨 LIMIT REACHED - IP: ${req.socket.remoteAddress} - URL: ${req.url} - Method: ${req.method}`);
-    return;
-}
-// ===== END RATE LIMITING CHECK =====
-
-
-
     try {
         // Find matching route (using current config)
         const route = findMatchingRoute(req.url.split('?')[0]);
@@ -254,8 +149,6 @@ if (!rateCheck.allowed) {
             }));
             return;
         }
-        console.log(`Request - IP: ${req.socket.remoteAddress} - URL: ${req.url} - Method: ${req.method}`);
-
         
         console.log(`  → Matched: ${route.path} -> ${route.target}`);
         
