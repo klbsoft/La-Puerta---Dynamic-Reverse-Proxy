@@ -8,24 +8,29 @@ const PROXY_NAME = "La Puerta";
 let config = loadConfig();
 let PORT = config['service-port'] || 3000;
 
+const MAX_REQUEST = config['max-request'] || 100;
+const REQUEST_WINDOW = config['request-window'] || 60000;
+const RESET_RATE_LIMIT = config['reset-rate-limit'] || 300000;
+const RESET_WINDOW_WITHIN = config['reset-window-within'] || 60;
+
 // ========== RATE LIMITING ==========
 const rateLimit = new Map(); // Store request counts per IP
 
-// Clean up old entries every 5 minutes
-setInterval(() => {
-    const now = Date.now();
-    for (const [ip, data] of rateLimit.entries()) {
-        if (now - data.resetTime > 0) {
-            rateLimit.delete(ip);
+    // Clean up old entries every 5 minutes
+   setInterval(() => {
+        const now = Date.now();
+        for (const [ip, data] of rateLimit.entries()) {
+            if (now - data.resetTime > 0) {
+                rateLimit.delete(ip);
+            }
         }
-    }
-}, 300000); // 5 minutes
+    }, RESET_RATE_LIMIT); // 5 minutes
 
 function checkRateLimit(req) {
     const ip = req.socket.remoteAddress;
     const now = Date.now();
-    const windowMs = 60000; // 1 minute window
-    const maxRequests = 100; // SAME LIMIT FOR EVERYONE
+    const windowMs = REQUEST_WINDOW; // 1 minute window
+    const maxRequests = MAX_REQUEST; // SAME LIMIT FOR EVERYONE
     
     if (!rateLimit.has(ip)) {
         rateLimit.set(ip, {
@@ -33,9 +38,7 @@ function checkRateLimit(req) {
             resetTime: now + windowMs
         });
         return { 
-            allowed: true, 
-            remaining: maxRequests - 1,
-            resetIn: 60
+            allowed: true,
         };
     }
     
@@ -48,7 +51,7 @@ function checkRateLimit(req) {
         return { 
             allowed: true, 
             remaining: maxRequests - 1,
-            resetIn: 60
+            resetIn: RESET_WINDOW_WITHIN
         };
     }
     

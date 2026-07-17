@@ -1,12 +1,18 @@
     {
       "service-port": 3002,
+
+      "max-request": 100,
+      "request-window":60000,
+      "reset-rate-limit":300000,
+      "reset-window-within":60,
       "routes": [
       {
         "path": "/",
         "target": "http://localhost:3007",
-        "enabled": true,
+        "enabled": false,
         " ": ""
       }
     
     ]
   }
+  
